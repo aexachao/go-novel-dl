@@ -9,8 +9,10 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/glebarez/sqlite v1.11.0
+	github.com/google/uuid v1.6.0
 	github.com/liuzl/gocc v0.0.0-20231231122217-0372e1059ca5
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/crypto v0.49.0
 	golang.org/x/image v0.37.0
 	golang.org/x/net v0.52.0
 	golang.org/x/text v0.35.0

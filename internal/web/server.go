@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/guohuiyuan/go-novel-dl/internal/app"
+	"github.com/guohuiyuan/go-novel-dl/internal/auth"
 	"github.com/guohuiyuan/go-novel-dl/internal/config"
 	"github.com/guohuiyuan/go-novel-dl/internal/model"
 	"github.com/guohuiyuan/go-novel-dl/internal/progress"
@@ -47,6 +48,13 @@ type Service struct {
 	SiteStats      []SiteStat
 	SiteConfigs    []config.SiteCatalogRecord
 	ParamSupports  []config.SiteParameterSupport
+	// Auth
+	AuthStore      *auth.Store
+	AuthHandler    *auth.Handler
+	AuthMiddleware *auth.Middleware
+	JWTSecret      string
+	AuthDBPath     string
+	AuthEnabled    bool
 }
 
 type SiteWarning struct {
@@ -92,8 +100,8 @@ type paginatedSearchResponse struct {
 	HasNext    bool `json:"has_next"`
 }
 
-func Start(port string, shouldOpenBrowser bool, configPath string, cliPageSize int) error {
-	service, err := newService(configPath)
+func Start(port string, shouldOpenBrowser bool, configPath string, cliPageSize int, authEnabled bool, authDBPath string, jwtSecret string) error {
+	service, err := newService(configPath, cliPageSize, authEnabled, authDBPath, jwtSecret)
 	if err != nil {
 		return err
 	}
@@ -115,7 +123,7 @@ func Start(port string, shouldOpenBrowser bool, configPath string, cliPageSize i
 	return router.Run(":" + port)
 }
 
-func newService(configPath string) (*Service, error) {
+func newService(configPath string, cliPageSize int, authEnabled bool, authDBPath string, jwtSecret string) (*Service, error) {
 	console := ui.NewConsole(strings.NewReader(""), io.Discard, io.Discard)
 	cfg, _, err := app.LoadOrInitConfig(console, configPath)
 	if err != nil {
@@ -139,7 +147,7 @@ func newService(configPath string) (*Service, error) {
 	paramSupports := config.SiteParameterSupports()
 	generalConfig, _ := config.LoadGeneralConfig()
 
-	return &Service{
+	svc := &Service{
 		Config:         cfg,
 		ConfigPath:     configPath,
 		GeneralConfig:  generalConfig,
@@ -152,7 +160,23 @@ func newService(configPath string) (*Service, error) {
 		SiteStats:      stats,
 		SiteConfigs:    siteConfigs,
 		ParamSupports:  paramSupports,
-	}, nil
+		AuthEnabled:    authEnabled,
+		AuthDBPath:     authDBPath,
+		JWTSecret:      jwtSecret,
+	}
+
+	if authEnabled {
+		authStore, err := auth.NewStore(authDBPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init auth store: %w", err)
+		}
+		jwtManager := auth.NewJWTManager(jwtSecret)
+		svc.AuthStore = authStore
+		svc.AuthHandler = auth.NewHandler(authStore, jwtManager)
+		svc.AuthMiddleware = auth.NewMiddleware(authStore, jwtManager)
+	}
+
+	return svc, nil
 }
 
 func (s *Service) reloadRuntime() error {
@@ -263,6 +287,22 @@ func newRouter(service *Service) *gin.Engine {
 	})
 
 	group := router.Group(RoutePrefix)
+
+	// --- Auth endpoints (no auth required) ---
+	if service.AuthEnabled && service.AuthHandler != nil {
+		auth := group.Group("/api/auth")
+		auth.GET("/health", service.AuthHandler.Health)
+		auth.POST("/register", service.AuthHandler.Register)
+		auth.POST("/login", service.AuthHandler.Login)
+		protected := auth.Group("")
+		protected.Use(service.AuthMiddleware.RequireAuth())
+		protected.GET("/me", service.AuthHandler.GetMe)
+		protected.POST("/api-keys", service.AuthHandler.CreateAPIKey)
+		protected.GET("/api-keys", service.AuthHandler.ListAPIKeys)
+		protected.DELETE("/api-keys/:key_id", service.AuthHandler.DeleteAPIKey)
+	}
+
+	// --- Web UI (no auth) ---
 	group.GET("/", func(c *gin.Context) {
 		c.HTML(http.StatusOK, "index.html", gin.H{
 			"Root":           RoutePrefix,
@@ -286,6 +326,28 @@ func newRouter(service *Service) *gin.Engine {
 	group.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+
+	// Middleware helper for auth-protected routes
+	authRequired := func() gin.HandlerFunc {
+		if !service.AuthEnabled || service.AuthMiddleware == nil {
+			return func(c *gin.Context) { c.Next() }
+		}
+		return service.AuthMiddleware.RequireAuth()
+	}
+	quotaSearch := func() gin.HandlerFunc {
+		if !service.AuthEnabled || service.AuthMiddleware == nil {
+			return func(c *gin.Context) { c.Next() }
+		}
+		return service.AuthMiddleware.RequireQuota("search")
+	}
+	quotaDownload := func() gin.HandlerFunc {
+		if !service.AuthEnabled || service.AuthMiddleware == nil {
+			return func(c *gin.Context) { c.Next() }
+		}
+		return service.AuthMiddleware.RequireQuota("download")
+	}
+
+	// --- Public meta (no auth) ---
 	group.GET("/api/meta", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"default_sources": service.DefaultSources,
@@ -293,8 +355,11 @@ func newRouter(service *Service) *gin.Engine {
 			"site_warnings":   service.SiteWarnings,
 			"site_stats":      service.SiteStats,
 			"general_config":  service.GeneralConfig,
+			"auth_enabled":    service.AuthEnabled,
 		})
 	})
+
+	// --- Config endpoints (auth required for writes) ---
 	group.GET("/api/general-config", func(c *gin.Context) {
 		record, err := config.LoadGeneralConfig()
 		if err != nil {
@@ -303,7 +368,7 @@ func newRouter(service *Service) *gin.Engine {
 		}
 		c.JSON(http.StatusOK, gin.H{"item": record})
 	})
-	group.PUT("/api/general-config", func(c *gin.Context) {
+	group.PUT("/api/general-config", authRequired(), func(c *gin.Context) {
 		var req config.GeneralConfigRecord
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
@@ -332,7 +397,7 @@ func newRouter(service *Service) *gin.Engine {
 			"managed_site_key": config.SiteCatalogSupportedKeys(),
 		})
 	})
-	group.PUT("/api/site-configs/:site", func(c *gin.Context) {
+	group.PUT("/api/site-configs/:site", authRequired(), func(c *gin.Context) {
 		siteKey := strings.TrimSpace(c.Param("site"))
 		if siteKey == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "site is required"})
@@ -383,7 +448,9 @@ func newRouter(service *Service) *gin.Engine {
 			"site_stats":    service.SiteStats,
 		})
 	})
-	group.GET("/api/books/detail", func(c *gin.Context) {
+
+	// --- Book operations (auth + quota) ---
+	group.GET("/api/books/detail", authRequired(), quotaSearch(), func(c *gin.Context) {
 		siteKey := strings.TrimSpace(c.Query("site"))
 		bookID := strings.TrimSpace(c.Query("book_id"))
 		if siteKey == "" || bookID == "" {
@@ -405,9 +472,16 @@ func newRouter(service *Service) *gin.Engine {
 			return
 		}
 
+		// Consume quota on success
+		if service.AuthEnabled && service.AuthStore != nil {
+			_ = service.AuthStore.IncrementSearch(auth.GetUserIDFromContext(c))
+		}
+
 		c.JSON(http.StatusOK, bookDetailResponse{Book: *book})
 	})
-	group.POST("/api/search", func(c *gin.Context) {
+
+	// --- Search (auth + quota) ---
+	group.POST("/api/search", authRequired(), quotaSearch(), func(c *gin.Context) {
 		var req searchRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
@@ -431,6 +505,10 @@ func newRouter(service *Service) *gin.Engine {
 				}
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
+			}
+			// Consume quota on success
+			if service.AuthEnabled && service.AuthStore != nil {
+				_ = service.AuthStore.IncrementSearch(auth.GetUserIDFromContext(c))
 			}
 			c.JSON(http.StatusOK, response)
 			return
@@ -484,9 +562,16 @@ func newRouter(service *Service) *gin.Engine {
 			return
 		}
 
+		// Consume quota on success
+		if service.AuthEnabled && service.AuthStore != nil {
+			_ = service.AuthStore.IncrementSearch(auth.GetUserIDFromContext(c))
+		}
+
 		c.JSON(http.StatusOK, paginateSearchResponse(response, page, pageSize))
 	})
-	group.POST("/api/download-tasks", func(c *gin.Context) {
+
+	// --- Download (auth + quota) ---
+	group.POST("/api/download-tasks", authRequired(), quotaDownload(), func(c *gin.Context) {
 		var req downloadRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
@@ -499,14 +584,17 @@ func newRouter(service *Service) *gin.Engine {
 			return
 		}
 
+		// Consume download quota
+		if service.AuthEnabled && service.AuthStore != nil {
+			_ = service.AuthStore.IncrementDownload(auth.GetUserIDFromContext(c))
+		}
+
 		task := service.Tasks.Create(req.Site, req.BookID)
 		service.startDownloadTask(task.ID, req)
 
-		c.JSON(http.StatusAccepted, gin.H{
-			"task": task,
-		})
+		c.JSON(http.StatusAccepted, gin.H{"task": task})
 	})
-	group.GET("/api/download-tasks/:id", func(c *gin.Context) {
+	group.GET("/api/download-tasks/:id", authRequired(), func(c *gin.Context) {
 		task, ok := service.Tasks.Snapshot(c.Param("id"))
 		if !ok {
 			c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
@@ -514,7 +602,7 @@ func newRouter(service *Service) *gin.Engine {
 		}
 		c.JSON(http.StatusOK, gin.H{"task": task})
 	})
-	group.GET("/api/download-file", func(c *gin.Context) {
+	group.GET("/api/download-file", authRequired(), func(c *gin.Context) {
 		filePath := strings.TrimSpace(c.Query("path"))
 		if filePath == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
