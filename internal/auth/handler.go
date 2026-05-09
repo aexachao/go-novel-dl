@@ -192,7 +192,7 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		return
 	}
 
-	keyID, rawKey, err := GenerateAPIKey()
+	keyID, rawKey := GenerateAPIKey()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate api key"})
 		return

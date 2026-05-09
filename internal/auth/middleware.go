@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"database/sql"
 	"net/http"
 	"strings"
 
@@ -38,21 +37,21 @@ func (m *Middleware) RequireAuth() gin.HandlerFunc {
 // RequireQuota checks that the user has remaining quota for the given action.
 func (m *Middleware) RequireQuota(action string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		claims, ok := c.Get("claims")
+		claimsVal, ok := c.Get("claims")
 		if !ok {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return
 		}
-		c := claims.(*Claims)
+		claims := claimsVal.(*Claims)
 
 		// Self-hosted users (identified by plan "unlimited") skip quota
-		if c.Plan == Plan("unlimited") {
+		if claims.Plan == Plan("unlimited") {
 			c.Next()
 			return
 		}
 
-		limits := GetLimits(c.Plan)
-		quota, err := m.store.GetQuota(c.UserID)
+		limits := GetLimits(claims.Plan)
+		quota, err := m.store.GetQuota(claims.UserID)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to check quota"})
 			return
@@ -66,20 +65,20 @@ func (m *Middleware) RequireQuota(action string) gin.HandlerFunc {
 		case "search":
 			if quota.SearchCount >= limits.DailySearch {
 				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error":       "每日搜索配额已用完",
-					"limit":       limits.DailySearch,
-					"reset_at":    quota.SearchResetAt,
-					"current_plan": c.Plan,
+					"error":        "每日搜索配额已用完",
+					"limit":        limits.DailySearch,
+					"reset_at":     quota.SearchResetAt,
+					"current_plan": claims.Plan,
 				})
 				return
 			}
 		case "download":
 			if quota.DownloadCount >= limits.DailyDownload {
 				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error":       "每日下载配额已用完",
-					"limit":       limits.DailyDownload,
-					"reset_at":    quota.DownloadResetAt,
-					"current_plan": c.Plan,
+					"error":        "每日下载配额已用完",
+					"limit":        limits.DailyDownload,
+					"reset_at":     quota.DownloadResetAt,
+					"current_plan": claims.Plan,
 				})
 				return
 			}
