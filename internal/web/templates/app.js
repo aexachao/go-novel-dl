@@ -67,6 +67,7 @@ const appState = {
   siteConfigs: new Map(),
   paramSupports: [],
   generalConfig: initialGeneralConfig,
+  authToken: null,
 };
 
 function renderSiteWarnings() {
@@ -303,9 +304,31 @@ function bindRangeValue(inputId) {
   }
 }
 
+function authHeaders(extra = {}) {
+  const headers = { "Content-Type": "application/json", ...extra };
+  if (appState.authToken) {
+    headers["Authorization"] = `Bearer ${appState.authToken}`;
+  }
+  return headers;
+}
+
+async function fetchGuestToken() {
+  try {
+    const response = await fetch(`${root}/api/auth/guest-token`);
+    const payload = await response.json();
+    if (response.ok && payload.token) {
+      appState.authToken = payload.token;
+    }
+  } catch (_) {
+    // Silently ignore — token may not be available
+  }
+}
+
 bootstrap();
 
 function bootstrap() {
+  void fetchGuestToken();
+
   if (generalBlurWebImagesLabelNode) generalBlurWebImagesLabelNode.textContent = "\u7f51\u9875\u56fe\u7247\u6a21\u7cca\u5316\uff08\u4ec5\u5f71\u54cd\u9875\u9762\u663e\u793a\uff09";
   renderSourceTagFilters();
   renderSourceSelector();
@@ -441,7 +464,7 @@ async function performSearch() {
   try {
     const response = await fetch(`${root}/api/search`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify({
         keyword, scope: "all", sites: Array.from(appState.selectedSites),
         page: appState.page, page_size: appState.pageSize,
@@ -779,7 +802,7 @@ async function fetchBookDetail(variant) {
   url.searchParams.set("book_id", variant.book_id);
   const payload = await fetchJSONWithTimeout(
     url.toString(),
-    {},
+    { headers: authHeaders() },
     detailLoadTimeoutMs(variant.site),
     `${sourceLabel(variant.site)} 详情/章节目录加载超时，请稍后重试或暂时切换来源`,
   );
@@ -1230,7 +1253,7 @@ async function fetchChapterContentText(site, bookID, ch) {
   url.searchParams.set("url", ch.url || "");
   const data = await fetchJSONWithTimeout(
     url.toString(),
-    {},
+    { headers: authHeaders() },
     chapterLoadTimeoutMs(site),
     `${sourceLabel(site)} 章节加载超时，请稍后重试或切换来源`,
   );
@@ -1455,7 +1478,7 @@ async function startDownloadTask(target, button) {
 
   try {
     const response = await fetch(`${root}/api/download-tasks`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method: "POST", headers: authHeaders(),
       body: JSON.stringify({ site, book_id: bookID }),
     });
     const payload = await response.json();
@@ -1471,7 +1494,7 @@ function startPollingTask(taskId) {
   if (appState.pollers.has(taskId)) return;
   const poll = async () => {
     try {
-      const response = await fetch(`${root}/api/download-tasks/${taskId}`);
+      const response = await fetch(`${root}/api/download-tasks/${taskId}`, { headers: authHeaders() });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "task fetch failed");
       const task = payload.task; upsertTask(task);
@@ -1726,7 +1749,7 @@ async function saveGeneralConfig() {
   };
 
   const response = await fetch(`${root}/api/general-config`, {
-    method: "PUT", headers: { "Content-Type": "application/json" },
+    method: "PUT", headers: authHeaders(),
     body: JSON.stringify(payload),
   });
   const data = await response.json();
@@ -1751,7 +1774,7 @@ async function saveSiteConfig() {
   };
 
   const response = await fetch(`${root}/api/site-configs/${encodeURIComponent(siteKey)}`, {
-    method: "PUT", headers: { "Content-Type": "application/json" },
+    method: "PUT", headers: authHeaders(),
     body: JSON.stringify(payload),
   });
   const data = await response.json();
