@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,16 +45,25 @@ func TestMetaIncludesSearchableDownloadSources(t *testing.T) {
 	if len(payload.DefaultSources) != 2 {
 		t.Fatalf("expected 2 default searchable download sources, got %d", len(payload.DefaultSources))
 	}
-	if len(payload.AllSources) != 2 {
-		t.Fatalf("expected 2 all searchable download sources, got %d", len(payload.AllSources))
+	if len(payload.AllSources) != 3 {
+		t.Fatalf("expected 3 all searchable download sources, got %d", len(payload.AllSources))
 	}
 
 	westnovel := findDescriptor(payload.AllSources, "westnovel")
 	if westnovel != nil {
 		t.Fatalf("did not expect westnovel in searchable web sources")
 	}
-	if findDescriptor(payload.AllSources, "biquge345") != nil {
-		t.Fatalf("did not expect biquge345 in searchable web sources")
+	if findDescriptor(payload.DefaultSources, "esjzone") == nil {
+		t.Fatalf("expected esjzone in default web sources")
+	}
+	if findDescriptor(payload.DefaultSources, "biquge345") == nil {
+		t.Fatalf("expected biquge345 in default web sources")
+	}
+	if findDescriptor(payload.DefaultSources, "yodu") != nil {
+		t.Fatalf("did not expect yodu in default web sources")
+	}
+	if findDescriptor(payload.AllSources, "biquge345") == nil {
+		t.Fatalf("expected biquge345 in searchable web sources")
 	}
 	if findDescriptor(payload.AllSources, "tongrenshe") != nil {
 		t.Fatalf("did not expect tongrenshe in searchable web sources")
@@ -118,6 +130,98 @@ func TestIndexPageIncludesBlurWebImagesControl(t *testing.T) {
 	for _, needle := range []string{`id="generalBlurWebImages"`, `"blur_web_images":true`} {
 		if !strings.Contains(body, needle) {
 			t.Fatalf("expected index page to contain %s, body=%s", needle, body)
+		}
+	}
+}
+
+func TestIndexPageIncludesDisableCacheControl(t *testing.T) {
+	service := newTestService()
+	service.GeneralConfig = config.GeneralConfigRecord{DisableCache: true}
+	router := newRouter(service)
+
+	req := httptest.NewRequest(http.MethodGet, RoutePrefix+"/", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+
+	body := resp.Body.String()
+	for _, needle := range []string{`id="generalDisableCache"`, `"disable_cache":true`} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("expected index page to contain %s, body=%s", needle, body)
+		}
+	}
+}
+
+func TestIndexPageGlobalSettingsKeepOnlyUsefulRuntimeKnobs(t *testing.T) {
+	service := newTestService()
+	router := newRouter(service)
+
+	req := httptest.NewRequest(http.MethodGet, RoutePrefix+"/", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+
+	body := resp.Body.String()
+	for _, needle := range []string{`id="generalWorkers"`, `id="generalTimeout"`, `id="generalRequestInterval"`, `id="generalFormats"`, `id="generalOutputDir"`} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("expected index page to contain %s, body=%s", needle, body)
+		}
+	}
+	for _, needle := range []string{`id="generalMaxConnections"`, `id="generalMaxRPS"`, `id="generalRetryTimes"`, `id="generalBackoffFactor"`} {
+		if strings.Contains(body, needle) {
+			t.Fatalf("expected index page to hide low-value runtime knob %s", needle)
+		}
+	}
+}
+
+func TestIndexPageSiteSettingsOnlyShowAuthAndMirrorFields(t *testing.T) {
+	service := newTestService()
+	router := newRouter(service)
+
+	req := httptest.NewRequest(http.MethodGet, RoutePrefix+"/", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+
+	body := resp.Body.String()
+	for _, needle := range []string{`id="siteConfigKey"`, `id="siteUsername"`, `id="sitePassword"`, `id="siteCookie"`, `id="siteMirrorHosts"`} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("expected index page to contain %s, body=%s", needle, body)
+		}
+	}
+	for _, needle := range []string{`id="siteLoginRequired"`, `id="siteWorkerLimit"`, `id="siteFetchImages"`, `id="siteLocaleStyle"`} {
+		if strings.Contains(body, needle) {
+			t.Fatalf("expected index page to hide redundant site setting %s", needle)
+		}
+	}
+}
+
+func TestSettingsScriptLimitsSiteConfigChoices(t *testing.T) {
+	data, err := templateFS.ReadFile("templates/app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	script := string(data)
+	for _, needle := range []string{
+		`const configurableSiteKeys = ["novalpie", "esjzone"];`,
+		`.filter((item) => configurableSiteKeys.includes(item.key))`,
+	} {
+		if !strings.Contains(script, needle) {
+			t.Fatalf("expected app.js to contain %s", needle)
+		}
+	}
+	for _, needle := range []string{`login_required:`, `worker_limit:`, `fetch_images:`} {
+		if strings.Contains(script, needle) {
+			t.Fatalf("expected site config payload to omit %s", needle)
 		}
 	}
 }
@@ -331,13 +435,159 @@ func TestBookDetailEndpointAppliesLocaleConversion(t *testing.T) {
 	}
 }
 
-func newTestService() *Service {
-	cfg := config.DefaultConfig()
-	if siteCfg, ok := cfg.Sites["esjzone"]; ok {
-		siteCfg.Username = "test-user"
-		siteCfg.Password = "test-password"
-		cfg.Sites["esjzone"] = siteCfg
+func TestBookDetailEndpointCachesAndDeduplicatesConcurrentRequests(t *testing.T) {
+	var calls int32
+	service := newTestServiceWithOptions(testServiceOptions{
+		downloadPlanCalls: &calls,
+		downloadPlanDelay: 20 * time.Millisecond,
+	})
+	router := newRouter(service)
+
+	runConcurrentRequests(t, 8, func() error {
+		req := httptest.NewRequest(http.MethodGet, RoutePrefix+"/api/books/detail?site=esjzone&book_id=001", nil)
+		resp := httptest.NewRecorder()
+		router.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			return fmt.Errorf("expected 200, got %d with body %s", resp.Code, resp.Body.String())
+		}
+		var payload bookDetailResponse
+		if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+			return fmt.Errorf("decode detail payload: %w", err)
+		}
+		if payload.Book.ID != "001" || len(payload.Book.Chapters) != 2 {
+			return fmt.Errorf("unexpected detail payload: %+v", payload.Book)
+		}
+		return nil
+	})
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected one real DownloadPlan call for concurrent detail requests, got %d", got)
 	}
+
+	req := httptest.NewRequest(http.MethodGet, RoutePrefix+"/api/books/detail?site=esjzone&book_id=001", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected cached detail request to return 200, got %d", resp.Code)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected cached detail request not to call DownloadPlan again, got %d", got)
+	}
+}
+
+func TestChapterContentEndpointCachesAndDeduplicatesConcurrentRequests(t *testing.T) {
+	var calls int32
+	service := newTestServiceWithOptions(testServiceOptions{
+		fetchChapterCalls: &calls,
+		fetchChapterDelay: 20 * time.Millisecond,
+	})
+	router := newRouter(service)
+
+	target := RoutePrefix + "/api/chapter-content?site=esjzone&book_id=001&chapter_id=c1&title=%E7%AC%AC%E4%B8%80%E7%AB%A0"
+	runConcurrentRequests(t, 8, func() error {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		resp := httptest.NewRecorder()
+		router.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			return fmt.Errorf("expected 200, got %d with body %s", resp.Code, resp.Body.String())
+		}
+		var payload struct {
+			Chapter model.Chapter `json:"chapter"`
+		}
+		if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+			return fmt.Errorf("decode chapter payload: %w", err)
+		}
+		if payload.Chapter.ID != "c1" || payload.Chapter.Content != "这是会长内容。" {
+			return fmt.Errorf("unexpected chapter payload: %+v", payload.Chapter)
+		}
+		return nil
+	})
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected one real FetchChapter call for concurrent chapter requests, got %d", got)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected cached chapter request to return 200, got %d", resp.Code)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected cached chapter request not to call FetchChapter again, got %d", got)
+	}
+}
+
+func TestChapterContentEndpointAcceptsURLAsChapterIdentity(t *testing.T) {
+	var calls int32
+	service := newTestServiceWithOptions(testServiceOptions{
+		fetchChapterCalls: &calls,
+	})
+	router := newRouter(service)
+
+	target := RoutePrefix + "/api/chapter-content?site=esjzone&book_id=001&url=https%3A%2F%2Fexample.com%2Fc1&title=%E7%AC%AC%E4%B8%80%E7%AB%A0"
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d with body %s", resp.Code, resp.Body.String())
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected FetchChapter to be called once, got %d", got)
+	}
+
+	var payload struct {
+		Chapter model.Chapter `json:"chapter"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode chapter payload: %v", err)
+	}
+	if payload.Chapter.Content != "这是会长内容。" {
+		t.Fatalf("unexpected chapter content: %+v", payload.Chapter)
+	}
+}
+
+func runConcurrentRequests(t *testing.T, count int, fn func() error) {
+	t.Helper()
+	var wg sync.WaitGroup
+	errs := make(chan error, count)
+	ready := make(chan struct{})
+
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ready
+			if err := fn(); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	close(ready)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func newTestService() *Service {
+	return newTestServiceWithOptions(testServiceOptions{})
+}
+
+type testServiceOptions struct {
+	downloadPlanCalls *int32
+	fetchChapterCalls *int32
+	downloadPlanDelay time.Duration
+	fetchChapterDelay time.Duration
+}
+
+func newTestServiceWithOptions(opts testServiceOptions) *Service {
+	cfg := config.DefaultConfig()
 	console := ui.NewConsole(strings.NewReader(""), io.Discard, io.Discard)
 	runtime := app.NewRuntime(&cfg, console)
 	registry := site.NewRegistry()
@@ -367,6 +617,16 @@ func newTestService() *Service {
 					{ID: "c2", Title: "Chapter 2", Order: 2},
 				},
 			},
+			chapter: model.Chapter{
+				ID:      "c1",
+				Title:   "第一章 會長測試",
+				Volume:  "正篇",
+				Content: "這是會長內容。",
+			},
+			downloadPlanCalls: opts.downloadPlanCalls,
+			fetchChapterCalls: opts.fetchChapterCalls,
+			downloadPlanDelay: opts.downloadPlanDelay,
+			fetchChapterDelay: opts.fetchChapterDelay,
 		}
 	})
 	registry.Register("westnovel", func(cfg config.ResolvedSiteConfig) site.Site {
@@ -420,6 +680,7 @@ func newTestService() *Service {
 		DefaultSources: searchableDownloadDescriptors(runtime.Registry.SiteDescriptors(runtime.DefaultSearchSites())),
 		AllSources:     searchableDownloadDescriptors(runtime.Registry.SiteDescriptors(runtime.AllSearchSites())),
 		Tasks:          NewDownloadTaskStore(),
+		ContentCache:   newWebContentCache(),
 	}
 }
 
@@ -438,6 +699,12 @@ type fakeWebSite struct {
 	capabilities site.Capabilities
 	results      []model.SearchResult
 	book         *model.Book
+	chapter      model.Chapter
+
+	downloadPlanCalls *int32
+	fetchChapterCalls *int32
+	downloadPlanDelay time.Duration
+	fetchChapterDelay time.Duration
 }
 
 func (s fakeWebSite) Key() string {
@@ -453,6 +720,16 @@ func (s fakeWebSite) Capabilities() site.Capabilities {
 }
 
 func (s fakeWebSite) DownloadPlan(ctx context.Context, ref model.BookRef) (*model.Book, error) {
+	if s.downloadPlanCalls != nil {
+		atomic.AddInt32(s.downloadPlanCalls, 1)
+	}
+	if s.downloadPlanDelay > 0 {
+		select {
+		case <-time.After(s.downloadPlanDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if s.book == nil {
 		return nil, nil
 	}
@@ -467,7 +744,31 @@ func (s fakeWebSite) DownloadPlan(ctx context.Context, ref model.BookRef) (*mode
 }
 
 func (s fakeWebSite) FetchChapter(ctx context.Context, bookID string, chapter model.Chapter) (model.Chapter, error) {
-	return model.Chapter{}, nil
+	if s.fetchChapterCalls != nil {
+		atomic.AddInt32(s.fetchChapterCalls, 1)
+	}
+	if s.fetchChapterDelay > 0 {
+		select {
+		case <-time.After(s.fetchChapterDelay):
+		case <-ctx.Done():
+			return model.Chapter{}, ctx.Err()
+		}
+	}
+	loaded := s.chapter
+	if strings.TrimSpace(loaded.ID) == "" && strings.TrimSpace(loaded.Title) == "" && strings.TrimSpace(loaded.Content) == "" {
+		loaded = chapter
+		loaded.Content = "這是會長內容。"
+	}
+	if strings.TrimSpace(loaded.ID) == "" {
+		loaded.ID = chapter.ID
+	}
+	if strings.TrimSpace(loaded.Title) == "" {
+		loaded.Title = chapter.Title
+	}
+	if strings.TrimSpace(loaded.URL) == "" {
+		loaded.URL = chapter.URL
+	}
+	return loaded, nil
 }
 
 func (s fakeWebSite) Download(ctx context.Context, ref model.BookRef) (*model.Book, error) {
