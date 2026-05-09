@@ -60,6 +60,8 @@ type Service struct {
 	JWTSecret      string
 	AuthDBPath     string
 	AuthEnabled    bool
+	GuestToken     string          // pre-generated guest JWT for web UI
+	AdminAPIKey    string          // protected admin key for managing users
 	ContentCache   *webContentCache
 	cacheMu        sync.Mutex
 }
@@ -138,8 +140,8 @@ type paginatedSearchResponse struct {
 	HasNext    bool `json:"has_next"`
 }
 
-func Start(port string, shouldOpenBrowser bool, configPath string, cliPageSize int, authEnabled bool, authDBPath string, jwtSecret string) error {
-	service, err := newService(configPath, cliPageSize, authEnabled, authDBPath, jwtSecret)
+func Start(port string, shouldOpenBrowser bool, configPath string, cliPageSize int, authEnabled bool, authDBPath string, jwtSecret string, adminKey string) error {
+	service, err := newService(configPath, cliPageSize, authEnabled, authDBPath, jwtSecret, adminKey)
 	if err != nil {
 		return err
 	}
@@ -161,7 +163,7 @@ func Start(port string, shouldOpenBrowser bool, configPath string, cliPageSize i
 	return router.Run(":" + port)
 }
 
-func newService(configPath string, cliPageSize int, authEnabled bool, authDBPath string, jwtSecret string) (*Service, error) {
+func newService(configPath string, cliPageSize int, authEnabled bool, authDBPath string, jwtSecret string, adminKey string) (*Service, error) {
 	console := ui.NewConsole(strings.NewReader(""), io.Discard, io.Discard)
 	cfg, _, err := app.LoadOrInitConfig(console, configPath)
 	if err != nil {
@@ -210,8 +212,25 @@ func newService(configPath string, cliPageSize int, authEnabled bool, authDBPath
 		}
 		jwtManager := auth.NewJWTManager(jwtSecret)
 		svc.AuthStore = authStore
-		svc.AuthHandler = auth.NewHandler(authStore, jwtManager)
+		svc.AuthHandler = auth.NewHandler(authStore, jwtManager, adminKey)
 		svc.AuthMiddleware = auth.NewMiddleware(authStore, jwtManager)
+		svc.AdminAPIKey = adminKey
+
+		// Ensure guest account exists and pre-generate a JWT for web UI use
+		guestEmail := "guest@web.noveldln.local"
+		guest, err := authStore.GetUserByEmail(guestEmail)
+		if err != nil || guest == nil {
+			// Create guest account with free plan
+			guest, err = authStore.CreateGuestUser(guestEmail)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create guest user: %w", err)
+			}
+		}
+		guestToken, err := jwtManager.GenerateAccessToken(guest)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate guest token: %w", err)
+		}
+		svc.GuestToken = guestToken
 	}
 
 	return svc, nil
@@ -379,6 +398,21 @@ func newRouter(service *Service) *gin.Engine {
 		protected.POST("/api-keys", service.AuthHandler.CreateAPIKey)
 		protected.GET("/api-keys", service.AuthHandler.ListAPIKeys)
 		protected.DELETE("/api-keys/:key_id", service.AuthHandler.DeleteAPIKey)
+
+		// Admin endpoint for managing user plans (protected by X-Admin-Key)
+		if service.AdminAPIKey != "" {
+			admin := group.Group("/api/admin")
+			admin.PUT("/users/:user_id/plan", service.AuthHandler.UpdateUserPlan)
+		}
+
+		// Guest token for web UI — no credentials needed
+		auth.GET("/guest-token", func(c *gin.Context) {
+			if service.GuestToken == "" {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "guest token not available"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"token": service.GuestToken, "token_type": "access"})
+		})
 	}
 
 	// --- Web UI (no auth) ---

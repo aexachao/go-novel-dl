@@ -81,6 +81,27 @@ func (s *Store) CreateUser(email, passwordHash string) (*User, error) {
 	return user, nil
 }
 
+// CreateGuestUser creates a guest account with a placeholder password hash.
+// The account is only accessible via pre-generated JWT (no password login).
+func (s *Store) CreateGuestUser(email string) (*User, error) {
+	id := generateID()
+	now := time.Now()
+	// Placeholder hash — guest account cannot be logged into with a password
+	placeholderHash := "$2a$10$guest.account.placeholder.hash.for.token.only"
+	_, err := s.db.Exec(
+		`INSERT INTO users (id, email, password_hash, plan, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, email, placeholderHash, PlanFree, now, now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert guest user: %w", err)
+	}
+	user := &User{ID: id, Email: email, Plan: PlanFree, CreatedAt: now, UpdatedAt: now}
+	if err := s.initQuota(user.ID); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
 func (s *Store) GetUserByEmail(email string) (*User, error) {
 	row := s.db.QueryRow(`SELECT id, email, password_hash, plan, created_at, updated_at FROM users WHERE email = ?`, email)
 	var u User

@@ -5,8 +5,9 @@ import "time"
 type Plan string
 
 const (
-	PlanFree = Plan("free")
-	PlanPro  = Plan("pro")
+	PlanFree      = Plan("free")
+	PlanPro       = Plan("pro")
+	PlanUnlimited = Plan("unlimited")
 )
 
 type User struct {
@@ -43,8 +44,9 @@ type QuotaLimits struct {
 }
 
 var PlanLimits = map[Plan]QuotaLimits{
-	PlanFree: {DailySearch: 50, DailyDownload: 5, MaxWorkers: 1, AllSites: false},
-	PlanPro:  {DailySearch: 500, DailyDownload: 50, MaxWorkers: 3, AllSites: true},
+	PlanFree:      {DailySearch: 50, DailyDownload: 5, MaxWorkers: 1, AllSites: false},
+	PlanPro:       {DailySearch: 500, DailyDownload: 50, MaxWorkers: 3, AllSites: true},
+	PlanUnlimited: {DailySearch: 999999, DailyDownload: 999999, MaxWorkers: 10, AllSites: true},
 }
 
 func GetLimits(plan Plan) QuotaLimits {

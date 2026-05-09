@@ -9,12 +9,13 @@ import (
 )
 
 type Handler struct {
-	store      *Store
-	jwtManager *JWTManager
+	store       *Store
+	jwtManager  *JWTManager
+	adminAPIKey string
 }
 
-func NewHandler(store *Store, jwtManager *JWTManager) *Handler {
-	return &Handler{store: store, jwtManager: jwtManager}
+func NewHandler(store *Store, jwtManager *JWTManager, adminAPIKey string) *Handler {
+	return &Handler{store: store, jwtManager: jwtManager, adminAPIKey: adminAPIKey}
 }
 
 type RegisterRequest struct {
@@ -257,4 +258,40 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 
 func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "go-novel-dl-auth"})
+}
+
+// UpdateUserPlan allows an admin to change a user's plan.
+// Protected by X-Admin-Key header.
+func (h *Handler) UpdateUserPlan(c *gin.Context) {
+	provided := c.GetHeader("X-Admin-Key")
+	if provided == "" || provided != h.adminAPIKey {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid X-Admin-Key"})
+		return
+	}
+
+	userID := c.Param("user_id")
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id is required"})
+		return
+	}
+
+	var req struct {
+		Plan string `json:"plan" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
+
+	if req.Plan != string(PlanFree) && req.Plan != string(PlanPro) && req.Plan != string(PlanUnlimited) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "plan must be 'free', 'pro', or 'unlimited'"})
+		return
+	}
+
+	if err := h.store.UpdateUserPlan(userID, Plan(req.Plan)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update plan: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "plan updated", "user_id": userID, "plan": req.Plan})
 }
